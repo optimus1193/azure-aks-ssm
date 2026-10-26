@@ -1,0 +1,45 @@
+# Checks out the customer config and this repo, then installs Terraform and kubelogin.
+# Agents need bash, Azure CLI, curl, unzip and sha256sum.
+parameters:
+  - name: terraformVersion
+    type: string
+
+steps:
+  - checkout: self # the customer repo
+    path: spoke
+    clean: true
+    fetchDepth: 1
+
+  - checkout: platform # this repo, at the ref pinned in the caller's resources
+    path: platform
+    clean: true
+    fetchDepth: 1
+
+  - bash: |
+      set -euo pipefail
+      case "$(uname -m)" in
+        x86_64) arch=amd64 ;;
+        aarch64 | arm64) arch=arm64 ;;
+        *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+      esac
+      dir="$AGENT_TEMPDIRECTORY/terraform"
+      zip="terraform_${TF_VERSION}_linux_${arch}.zip"
+      base="https://releases.hashicorp.com/terraform/$TF_VERSION"
+      mkdir -p "$dir"
+      cd "$dir"
+      curl -fsSLO "$base/$zip"
+      curl -fsSL "$base/terraform_${TF_VERSION}_SHA256SUMS" | grep " $zip\$" | sha256sum -c -
+      unzip -o -q "$zip"
+      rm -f "$zip"
+      echo "##vso[task.prependpath]$dir"
+    displayName: Install Terraform ${{ parameters.terraformVersion }}
+    env:
+      TF_VERSION: ${{ parameters.terraformVersion }}
+
+  - bash: |
+      set -euo pipefail
+      bin="$AGENT_TEMPDIRECTORY/bin"
+      mkdir -p "$bin"
+      az aks install-cli --install-location "$bin/kubectl" --kubelogin-install-location "$bin/kubelogin"
+      echo "##vso[task.prependpath]$bin"
+    displayName: Install kubelogin

@@ -47,3 +47,35 @@ run "typos_and_missing_keys_fail" {
   }
   expect_failures = [output.settings]
 }
+
+run "mode_defaults_to_create" {
+  command = plan
+  variables {
+    config_file = "tests/fixtures/minimal.yaml"
+  }
+
+  assert {
+    condition     = output.mode == "create"
+    error_message = "A config without mode must be treated as create"
+  }
+}
+
+run "destroy_with_lock_off" {
+  command = plan
+  variables {
+    config_file = "tests/fixtures/destroy.yaml"
+  }
+
+  assert {
+    condition     = output.mode == "destroy"
+    error_message = "mode: destroy must be passed through to the pipeline"
+  }
+}
+
+run "destroy_refused_while_delete_lock_on" {
+  command = plan
+  variables {
+    config_file = "tests/fixtures/destroy-locked.yaml"
+  }
+  expect_failures = [output.settings]
+}

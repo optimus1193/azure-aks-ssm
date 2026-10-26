@@ -81,6 +81,15 @@ jobs:
           terraform_version: 1.11.4 # same version the hub tests run on
           terraform_wrapper: false
 
+      # mode: destroy is only implemented in the Azure DevOps template (pipelines/provision.yml), which has a destroy-specific approval
+      - name: Check config.yaml mode
+        run: |
+          mode=$(bash platform/scripts/check-config.sh "$CONFIG_FILE")
+          if [ "$mode" != create ]; then
+            echo "::error::mode: $mode is supported only by the Azure DevOps pipeline. Use mode: create here."
+            exit 1
+          fi
+
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:

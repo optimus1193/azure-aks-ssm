@@ -1,5 +1,11 @@
 # Test fixture: mirrors the customer template (azure-aks-customer/environments/prod/config.yaml)
 
+# Lifecycle toggle for everything this pipeline provisions in this environment:
+#   create   provision it and keep it in sync with this file. Leave it on create day to day.
+#   destroy  delete all of it (02-platform, then 01-cluster). Also set features.delete_lock: false.
+#            Switch back to create later to provision it again.
+mode: create
+
 name: myapp                 # used in resource names: aks-myapp-prod, rg-aks-myapp-prod
 environment: prod
 subscription_id: 00000000-0000-0000-0000-000000000000

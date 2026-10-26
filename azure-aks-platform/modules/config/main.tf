@@ -29,7 +29,7 @@ locals {
   # Allowed keys per section. Anything else is a typo or an unsupported option and fails the plan,
   # instead of being silently ignored.
   allowed_keys = {
-    top = ["name", "environment", "subscription_id", "location", "tags", "features", "cluster", "platform"]
+    top = ["mode", "name", "environment", "subscription_id", "location", "tags", "features", "cluster", "platform"]
     cluster = [
       "name", "resource_group_name", "create_resource_group", "node_resource_group_name",
       "kubernetes_version", "sku_tier",
@@ -72,6 +72,9 @@ locals {
 
   name        = try(lower(local.raw.name), "")
   environment = try(lower(local.raw.environment), "")
+
+  # Lifecycle toggle read by the pipeline: create = provision and keep in sync, destroy = remove everything
+  mode = try(lower(local.raw.mode), "create")
 
   features = merge(local.default_features, {
     for k, v in local.customer_features : k => v if contains(keys(local.default_features), k)

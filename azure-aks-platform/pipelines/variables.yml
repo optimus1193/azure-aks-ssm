@@ -1,0 +1,26 @@
+# Variables shared by every stage of provision.yml. They reach the scripts as environment variables.
+parameters:
+  - name: environment
+    type: string
+  - name: stateResourceGroup
+    type: string
+  - name: stateStorageAccount
+    type: string
+  - name: stateKeyPrefix
+    type: string
+
+variables:
+  - name: CONFIG_FILE
+    value: $(Pipeline.Workspace)/spoke/environments/${{ parameters.environment }}/config.yaml
+  - name: PLATFORM_DIR
+    value: $(Pipeline.Workspace)/platform
+  - name: TF_STATE_RESOURCE_GROUP
+    value: ${{ parameters.stateResourceGroup }}
+  - name: TF_STATE_STORAGE_ACCOUNT
+    value: ${{ parameters.stateStorageAccount }}
+  - name: TF_STATE_KEY_PREFIX
+    value: ${{ parameters.stateKeyPrefix }}
+  - name: TF_PLAN_CHANGES_FILE
+    value: $(Agent.TempDirectory)/plan-changes
+  - name: TF_IN_AUTOMATION
+    value: "true"

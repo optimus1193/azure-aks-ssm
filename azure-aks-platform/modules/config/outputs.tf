@@ -1,6 +1,7 @@
 # Every stack reads `settings`, so the checks below run before any resource is planned.
 output "settings" {
   value = {
+    mode                = local.mode
     name                = local.name
     environment         = local.environment
     subscription_id     = local.required.subscription_id
@@ -34,4 +35,18 @@ output "settings" {
     condition     = alltrue([for v in values(local.features) : can(tobool(v))])
     error_message = "Every value under `features` must be true or false."
   }
+  precondition {
+    condition     = contains(["create", "destroy"], local.mode)
+    error_message = "mode must be create or destroy."
+  }
+  # Terraform removes the lock itself during a destroy, so the lock only protects anything if destroy checks it first
+  precondition {
+    condition     = local.mode != "destroy" || try(!tobool(local.features.delete_lock), false)
+    error_message = "mode: destroy needs features.delete_lock: false (delete_lock is on by default in prod). Set both in the same commit to confirm the destroy."
+  }
+}
+
+# Read by scripts/check-config.sh, so the pipeline knows which stacks to run and in which order
+output "mode" {
+  value = local.mode
 }

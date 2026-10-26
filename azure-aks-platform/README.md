@@ -5,12 +5,31 @@ The **hub** for AKS provisioning. The platform team owns all the Terraform here:
 Customers (**spokes**) don't write Terraform. A spoke repo ([`azure-aks-customer`](https://github.com/my-org/azure-aks-customer) is the template) holds only:
 
 ```
-environments/<env>/config.yaml     what to provision, and the toggles
+environments/<env>/config.yaml     what to provision, the feature toggles, and mode: create | destroy
 environments/<env>/rbac/*.yaml     optional Kubernetes RBAC manifests
-.github/workflows/aks.yml          short caller of this repo's reusable workflow
+azure-pipelines.yml                short Azure DevOps pipeline that calls pipelines/provision.yml (primary)
+.github/workflows/aks.yml          short caller of this repo's reusable GitHub workflow (create mode only)
 ```
 
 ## How a run works
+
+### Azure DevOps (primary)
+
+```
+spoke commit to main / PR
+  └─ azure-pipelines.yml  ──template──▶  azure-aks-platform/pipelines/provision.yml  (repository resource @ refs/tags/<tag>)
+       Plan_<env>     checkout spoke + this repo, install Terraform + kubelogin
+                      scripts/check-config.sh          → mode (create | destroy)
+                      scripts/run-environment.sh plan  → plan, or destroy plan; records which stacks change
+       Apply_<env>    mode create,  main only, plan has changes; environment <env>
+                      scripts/run-environment.sh apply → 01-cluster, then 02-platform
+       Destroy_<env>  mode destroy, main only, plan has changes; ManualValidation + environment <env>-destroy
+                      scripts/run-environment.sh apply → destroy 02-platform, then 01-cluster
+```
+
+Authentication is an Azure Resource Manager service connection with workload identity federation. Every Terraform step runs inside `AzureCLI@2`, so the azurerm backend, the provider and kubelogin (`azurecli` mode) all use that session.
+
+### GitHub Actions
 
 ```
 spoke PR / merge
@@ -21,7 +40,7 @@ spoke PR / merge
                                               └─ scripts/run-stack.sh 02-platform <plan|apply> config.yaml
 ```
 
-Pull requests plan. A merge to `main` applies through the GitHub environment `<env>`, so its required reviewers are the approval gate (plans use `<env>-plan`). State is stored in the customer's storage account under `<org>/<repo>/<env>/<stage>.tfstate`.
+This path supports `mode: create` only; it fails if a config is in `destroy` mode. Pull requests plan. A merge to `main` applies through the GitHub environment `<env>`, so its required reviewers are the approval gate (plans use `<env>-plan`). State is stored in the customer's storage account under `<org>/<repo>/<env>/<stage>.tfstate`.
 
 ## Layout
 
@@ -35,9 +54,33 @@ modules/
   node-provisioning/     Karpenter NodePool + AKSNodeClass for Node Auto Provisioning
   platform-addons/       Traefik, ArgoCD (core), Kyverno + Policy Reporter, Reloader, RBAC manifests (optional)
   workload-identity/     Managed identity + federated credential for one service account (IRSA equivalent)
-scripts/run-stack.sh     init (backend per customer environment) + plan/apply one stack
-.github/workflows/provision.yml   reusable workflow that spokes call
+scripts/
+  check-config.sh        validate config.yaml with modules/config (no Azure access) and print its mode
+  run-environment.sh     both stacks in the order the mode needs (plan | apply)
+  run-stack.sh           init (backend per customer environment) + plan/apply/plan-destroy/destroy of one stack
+pipelines/
+  provision.yml          Azure DevOps stages template that spokes call (Plan, Apply, Destroy)
+  variables.yml, steps/setup.yml   shared variables and setup steps for it
+.github/workflows/provision.yml   reusable GitHub workflow that spokes call (create mode only)
 ```
+
+## Create / destroy toggle (`mode`)
+
+`mode` is a top-level key in the spoke's `config.yaml`. It is `create` when omitted.
+
+| `mode` | Plan stage | On `main`, after approval |
+|---|---|---|
+| `create` | plan 01-cluster, then 02-platform | `Apply_<env>`: apply them in that order |
+| `destroy` | destroy plan of 02-platform, then 01-cluster | `Destroy_<env>`: destroy them in that order |
+
+Guardrails on destroy:
+
+- **`features.delete_lock` must be `false`.** Terraform deletes the management lock itself during a destroy, so the lock alone wouldn't stop the pipeline. `modules/config` therefore refuses `mode: destroy` while the lock is on (the default in prod). Setting both keys is an explicit, reviewable statement in the commit.
+- **Two approvals.** `ManualValidation@1` in a server job comes first. It is part of the template, so a destroy still waits for a person even if the ADO environment `<env>-destroy` was auto-created with no checks. The person who started the run can't approve it. The deployment job on `<env>-destroy` comes next, with its own approvals.
+- **The approved mode must still match.** The apply and destroy jobs re-read `config.yaml` with `EXPECTED_MODE` set. A run approved for `create` can't destroy, and the reverse is also true.
+- **Only changes are gated.** Apply and Destroy are skipped when the plan has no changes. An already-destroyed environment left in `destroy` mode is a no-op, and a commit to one environment doesn't ask for approvals on another.
+
+Destroy removes only what the stacks created. The VNet, the state storage account, the platform Key Vault and the ACR are inputs, so they stay. The KMS key vault has purge protection, so after a destroy it stays soft-deleted for 90 days. A later `create` makes a new one with a fresh random suffix. If anything outside Terraform added resources to the cluster resource group, `prevent_deletion_if_contains_resources` stops the resource group delete and names them. Remove them, then re-run.
 
 ## What the hub enforces
 
@@ -53,7 +96,7 @@ Required: `name`, `environment`, `subscription_id`, `location`, `cluster.kuberne
 
 | Section | Keys |
 |---|---|
-| top level | `name`, `environment` (dev/test/uat/preprod/prod), `subscription_id`, `location`, `tags`, `features`, `cluster`, `platform` |
+| top level | `mode` (`create` default, or `destroy`), `name`, `environment` (dev/test/uat/preprod/prod), `subscription_id`, `location`, `tags`, `features`, `cluster`, `platform` |
 | `features` | `node_auto_provisioning`, `kms_etcd_encryption`, `defender`, `azure_policy`, `key_vault_secrets_provider`, `container_insights`, `managed_prometheus` (default `true`); `delete_lock` (default `true` in prod only); `keda`, `vpa` (default `false`); `kyverno`, `reloader`, `rbac_manifests` (default `true`) |
 | `cluster` | Same names as the [aks-cluster variables](modules/aks-cluster/variables.tf), minus the `enable_*` toggles (those are in `features`): `name`, `resource_group_name`, `create_resource_group`, `node_resource_group_name`, `kubernetes_version`, `sku_tier`, `vnet_subnet_id`, `additional_network_contributor_scopes`, `network`, `private_dns_zone_id`, `private_cluster_public_fqdn_enabled`, `system_node_pool`, `user_node_pools`, `host_encryption_enabled`, `automatic_upgrade_channel`, `node_os_upgrade_channel`, `maintenance_window`, `image_cleaner_interval_hours`, `admin_group_object_ids`, `cluster_role_assignments`, `grant_deployer_cluster_admin`, `acr_ids`, `run_command_enabled`, `kms_key_vault_network_access`, `kms_private_endpoint`, `secret_rotation_interval`, `storage_drivers`, `log_analytics_workspace_id`, `log_retention_in_days`, `log_daily_quota_gb`, `control_plane_log_categories`, `container_insights` |
 | `platform` | Same names as the [platform-addons variables](modules/platform-addons/variables.tf): `platform_key_vault_id`, `helm_repository_override`, `chart_versions`, `ingress_class_name`, `traefik`, `argocd`, `kyverno_dashboard_domain`; plus `node_pools` ([node-provisioning](modules/node-provisioning/variables.tf)) |
@@ -64,7 +107,21 @@ To expose a new module option to customers, add it in three places: the module v
 
 The EKS repo configures the `kubernetes`, `helm` and `kubectl` providers inside the cluster module, in the same apply that creates the cluster. A `time_sleep 180s` covers the race. That pattern breaks module `count`/`depends_on` and causes errors on replace or destroy. Here, `01-cluster` creates the cluster. `02-platform` then reads it through a data source, so the providers get real values at plan time and no sleep is needed. Both stacks get the cluster name from the same config, so no remote state lookup is needed. On a brand-new environment, a plan-only run skips 02-platform until 01-cluster has been applied.
 
-## Onboarding a spoke
+## Onboarding a spoke (Azure DevOps)
+
+1. Create the customer repo from `azure-aks-customer` and fill in `environments/<env>/config.yaml`. Keep `mode: create`.
+2. Create an Azure Resource Manager service connection per environment, using **workload identity federation**. Grant its identity the same roles as in step 3 of the GitHub list below.
+3. Give the spoke pipeline access to this repo: on `azure-aks-platform`, allow the spoke project's build service to read the repo. Then check that the `ref:` in `azure-pipelines.yml` is a release tag. For a GitHub-hosted platform repo, use `type: github` with a GitHub service connection.
+4. Provide an agent pool that can reach the private API server: self-hosted agents, or a Managed DevOps Pool injected into the VNet or a peered one. Agents need bash, Azure CLI, curl, unzip and sha256sum. The pipeline installs Terraform and kubelogin.
+5. **Before the first run**, create two ADO environments. If they don't exist, ADO creates them on first use with no checks.
+   - `<env>`: approvals for applies, plus an Exclusive Lock check.
+   - `<env>-destroy`: stricter approvals for destroys, plus an Exclusive Lock check.
+6. Authorize the pipeline to use the service connection, agent pool and environments. If the repo is in Azure Repos, add a Build Validation branch policy on `main`, so that pull requests run the plan.
+7. Set `destroyApprovers` in `azure-pipelines.yml` to the group allowed to confirm destroys.
+
+Moving a spoke from GitHub Actions to ADO: set `stateKeyPrefix` to the key the workflow used (`<org>/<repo>/<env>`). Otherwise the first plan would create a second copy of the environment. Then disable the GitHub workflow.
+
+## Onboarding a spoke (GitHub Actions)
 
 1. Create the customer repo from `azure-aks-customer` and fill in `environments/<env>/config.yaml`.
 2. Create an Entra app registration (or user-assigned identity) for the pipeline, with federated credentials for `repo:<org>/<repo>:environment:<env>` and `repo:<org>/<repo>:environment:<env>-plan`.
@@ -83,7 +140,7 @@ The EKS repo configures the `kubernetes`, `helm` and `kubectl` providers inside 
 
 ## Releasing
 
-Spokes pin `uses: ...provision.yml@<tag>` and `platform_version: <tag>`, so a change reaches them only through a tag.
+Spokes pin a tag, so a change reaches them only through a tag. In ADO it is the single `ref: refs/tags/<tag>` on the `platform` repository resource. In GitHub it is both `uses: ...provision.yml@<tag>` and `platform_version: <tag>`.
 
 1. Run the tests (below), merge to `main`, then tag with semver: `git tag v1.1.0 && git push origin v1.1.0`.
 2. **Major** bump when a customer has to change their config or the plan replaces resources (renamed or removed keys, new required keys, an optional add-on made core). **Minor** for new options or chart bumps. **Patch** for fixes.
@@ -108,6 +165,7 @@ az login
 export TF_STATE_RESOURCE_GROUP=rg-tfstate-prod TF_STATE_STORAGE_ACCOUNT=sttfstateprod001
 export TF_STATE_KEY_PREFIX=my-org/azure-aks-customer/prod
 scripts/run-stack.sh 01-cluster plan ../azure-aks-customer/environments/prod/config.yaml
+scripts/run-environment.sh plan ../azure-aks-customer/environments/prod/config.yaml   # both stacks, follows mode
 ```
 
 ## EKS → AKS mapping
@@ -151,5 +209,5 @@ scripts/run-stack.sh 01-cluster plan ../azure-aks-customer/environments/prod/con
 - **Kubernetes minor upgrade:** the customer bumps `cluster.kubernetes_version` in `config.yaml` and merges. Patch upgrades and node images are applied automatically in the maintenance window. The auto-upgrade channel is limited to `patch`/`none` so minor versions never drift from code.
 - **Chart upgrades:** change `local.default_chart_versions` in `modules/platform-addons/locals.tf` and release a new tag. A customer can override one chart with `platform.chart_versions` in `config.yaml`.
 - **KMS key rotation:** create a new key version in the KMS Key Vault and re-run the customer's pipeline. AKS re-encrypts secrets with the new version.
-- **Delete lock:** set `features.delete_lock: false` and apply before removing node pools or destroying the cluster.
+- **Delete lock:** set `features.delete_lock: false` and apply before removing node pools. To destroy the whole environment, set it together with `mode: destroy` (see [Create / destroy toggle](#create--destroy-toggle-mode)).
 - **Node Auto Provisioning vs cluster-autoscaler:** they can't run together. With NAP on, the system pool and any `user_node_pools` have a fixed size. Set `features.node_auto_provisioning: false` to use cluster-autoscaler on `cluster.user_node_pools` instead.

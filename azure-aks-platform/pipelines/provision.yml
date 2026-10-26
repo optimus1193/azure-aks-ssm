@@ -1,0 +1,205 @@
+# Stages template that customer (spoke) pipelines in Azure DevOps call. ADO counterpart of .github/workflows/provision.yml.
+#
+# The caller declares this repo as a repository resource with the alias `platform`, pinned to a release tag.
+# That one ref selects both this template and the Terraform code that runs.
+#
+# `mode` in the customer's config.yaml decides what a run on applyBranch does after Plan_<env>:
+#   create   Apply_<env>    approval on environment <env>, then apply 01-cluster and 02-platform
+#   destroy  Destroy_<env>  manual confirmation by destroyApprovers, approval on environment <env>-destroy,
+#                           then destroy 02-platform and 01-cluster
+# Either stage runs only when the plan has changes. Pull requests and planOnly runs stop after Plan_<env>.
+
+parameters:
+  # Folder under environments/ in the customer repo, e.g. prod. Letters and digits only (it is part of stage names).
+  - name: environment
+    type: string
+  # Azure Resource Manager service connection (workload identity federation) for this environment
+  - name: serviceConnection
+    type: string
+  - name: stateResourceGroup
+    type: string
+  - name: stateStorageAccount
+    type: string
+  # Blob prefix for this environment's state, e.g. my-org/azure-aks-customer/prod. Never change it after the first apply.
+  - name: stateKeyPrefix
+    type: string
+  # Users or groups who must confirm a destroy, comma-separated, e.g. [MyProject]\AKS-Platform-Admins
+  - name: destroyApprovers
+    type: string
+  # Agents must reach the private API server: self-hosted or Managed DevOps Pool in, or peered to, the VNet
+  - name: pool
+    type: object
+    default:
+      name: aks-private-agents
+  - name: planOnly
+    type: boolean
+    default: false
+  - name: applyBranch
+    type: string
+    default: refs/heads/main
+  - name: terraformVersion
+    type: string
+    default: 1.11.4 # same version the hub tests run on
+
+stages:
+  - stage: Plan_${{ parameters.environment }}
+    displayName: Plan ${{ parameters.environment }}
+    dependsOn: []
+    variables:
+      - template: variables.yml
+        parameters:
+          environment: ${{ parameters.environment }}
+          stateResourceGroup: ${{ parameters.stateResourceGroup }}
+          stateStorageAccount: ${{ parameters.stateStorageAccount }}
+          stateKeyPrefix: ${{ parameters.stateKeyPrefix }}
+    jobs:
+      - job: Plan
+        pool: ${{ parameters.pool }}
+        steps:
+          - template: steps/setup.yml
+            parameters:
+              terraformVersion: ${{ parameters.terraformVersion }}
+
+          - bash: |
+              set -euo pipefail
+              mode=$(bash "$PLATFORM_DIR/scripts/check-config.sh" "$CONFIG_FILE")
+              echo "mode: $mode"
+              echo "##vso[task.setvariable variable=mode;isOutput=true]$mode"
+              echo "##vso[build.addbuildtag]$ENV_NAME-$mode"
+            name: config
+            displayName: Check config.yaml and read mode
+            env:
+              ENV_NAME: ${{ parameters.environment }}
+
+          - task: AzureCLI@2
+            name: plan
+            displayName: Terraform plan (create or destroy, per mode)
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                rm -f "$TF_PLAN_CHANGES_FILE"
+                bash "$PLATFORM_DIR/scripts/run-environment.sh" plan "$CONFIG_FILE"
+
+                if [ -s "$TF_PLAN_CHANGES_FILE" ]; then changes=true; else changes=false; fi
+                echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
+
+                summary="$AGENT_TEMPDIRECTORY/plan-summary.md"
+                {
+                  echo "## $ENV_NAME: mode \`$MODE\`"
+                  if [ "$changes" = true ]; then
+                    echo "Stacks with changes: $(paste -sd, "$TF_PLAN_CHANGES_FILE"). The full plan is in the log of this step."
+                  else
+                    echo "No changes. Nothing will be applied."
+                  fi
+                  if [ "$MODE" = destroy ] && [ "$changes" = true ]; then
+                    echo
+                    echo "**Approving Destroy_$ENV_NAME deletes every resource this pipeline created in $ENV_NAME.**"
+                  fi
+                } >"$summary"
+                echo "##vso[task.uploadsummary]$summary"
+            env:
+              ENV_NAME: ${{ parameters.environment }}
+              MODE: $(config.mode)
+              TF_VAR_kubelogin_login_mode: azurecli # uses the az session of this task
+
+  - ${{ if not(parameters.planOnly) }}:
+      - stage: Apply_${{ parameters.environment }}
+        displayName: Apply ${{ parameters.environment }}
+        dependsOn: Plan_${{ parameters.environment }}
+        condition: >-
+          and(succeeded(),
+              eq(variables['Build.SourceBranch'], '${{ parameters.applyBranch }}'),
+              ne(variables['Build.Reason'], 'PullRequest'),
+              eq(dependencies.Plan_${{ parameters.environment }}.outputs['Plan.config.mode'], 'create'),
+              eq(dependencies.Plan_${{ parameters.environment }}.outputs['Plan.plan.changes'], 'true'))
+        variables:
+          - template: variables.yml
+            parameters:
+              environment: ${{ parameters.environment }}
+              stateResourceGroup: ${{ parameters.stateResourceGroup }}
+              stateStorageAccount: ${{ parameters.stateStorageAccount }}
+              stateKeyPrefix: ${{ parameters.stateKeyPrefix }}
+        jobs:
+          # Approvals and checks on the ADO environment "<env>" gate this job
+          - deployment: Apply
+            pool: ${{ parameters.pool }}
+            environment: ${{ parameters.environment }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - download: none
+                    - template: steps/setup.yml
+                      parameters:
+                        terraformVersion: ${{ parameters.terraformVersion }}
+                    - task: AzureCLI@2
+                      displayName: Terraform apply
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: bash "$PLATFORM_DIR/scripts/run-environment.sh" apply "$CONFIG_FILE"
+                      env:
+                        EXPECTED_MODE: create
+                        TF_VAR_kubelogin_login_mode: azurecli
+
+      - stage: Destroy_${{ parameters.environment }}
+        displayName: Destroy ${{ parameters.environment }}
+        dependsOn: Plan_${{ parameters.environment }}
+        condition: >-
+          and(succeeded(),
+              eq(variables['Build.SourceBranch'], '${{ parameters.applyBranch }}'),
+              ne(variables['Build.Reason'], 'PullRequest'),
+              eq(dependencies.Plan_${{ parameters.environment }}.outputs['Plan.config.mode'], 'destroy'),
+              eq(dependencies.Plan_${{ parameters.environment }}.outputs['Plan.plan.changes'], 'true'))
+        variables:
+          - template: variables.yml
+            parameters:
+              environment: ${{ parameters.environment }}
+              stateResourceGroup: ${{ parameters.stateResourceGroup }}
+              stateStorageAccount: ${{ parameters.stateStorageAccount }}
+              stateKeyPrefix: ${{ parameters.stateKeyPrefix }}
+        jobs:
+          # Built into the pipeline, so a destroy waits for a person even if the "<env>-destroy" environment has no checks yet
+          - job: Confirm
+            displayName: Confirm destroy
+            pool: server
+            timeoutInMinutes: 1440
+            steps:
+              - task: ManualValidation@1
+                inputs:
+                  notifyUsers: ${{ parameters.destroyApprovers }}
+                  approvers: ${{ parameters.destroyApprovers }}
+                  allowApproversToApproveTheirOwnRuns: false
+                  instructions: >-
+                    config.yaml for ${{ parameters.environment }} is set to mode: destroy. Resuming deletes the AKS cluster,
+                    its add-ons and every Azure resource this pipeline created in ${{ parameters.environment }}.
+                    Read the destroy plan in the Plan_${{ parameters.environment }} stage first. Reject to keep the environment.
+                  onTimeout: reject
+
+          # Approvals and checks on the ADO environment "<env>-destroy" gate this job
+          - deployment: Destroy
+            dependsOn: Confirm
+            pool: ${{ parameters.pool }}
+            environment: ${{ parameters.environment }}-destroy
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - download: none
+                    - template: steps/setup.yml
+                      parameters:
+                        terraformVersion: ${{ parameters.terraformVersion }}
+                    - task: AzureCLI@2
+                      displayName: Terraform destroy (02-platform, then 01-cluster)
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: bash "$PLATFORM_DIR/scripts/run-environment.sh" apply "$CONFIG_FILE"
+                      env:
+                        EXPECTED_MODE: destroy
+                        TF_VAR_kubelogin_login_mode: azurecli

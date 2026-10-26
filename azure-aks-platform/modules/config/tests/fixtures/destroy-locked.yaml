@@ -1,0 +1,12 @@
+mode: destroy
+name: myapp
+environment: prod
+subscription_id: 00000000-0000-0000-0000-000000000000
+location: southafricanorth
+cluster:
+  kubernetes_version: "1.35"
+  vnet_subnet_id: /subscriptions/x/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/v/subnets/s
+platform:
+  platform_key_vault_id: /subscriptions/x/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/kv
+  argocd:
+    domain: argocd.example.com
