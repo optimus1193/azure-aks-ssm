@@ -1,0 +1,95 @@
+# Test fixture: mirrors the customer template (azure-aks-customer/environments/prod/config.yaml)
+
+name: myapp                 # used in resource names: aks-myapp-prod, rg-aks-myapp-prod
+environment: prod
+subscription_id: 00000000-0000-0000-0000-000000000000
+location: southafricanorth
+
+tags:
+  Backup: Enabled
+  Disaster_Recovery: DR_Site_1
+  Business_Criticality: High
+  IT_Owner: Platform_Team
+  Infra_Team: Platform_Team
+  Application_Team: App_Team_Name
+  Business_Owner: Business_Owner_Name
+  Cost_Center: CC123
+  Service_Type: WebApp
+  Region: southafricanorth
+  Compliance_Framework: PCI-DSS
+  Data_Sensitivity: Internal
+
+# Optional features. Traefik and ArgoCD are always installed and cannot be toggled.
+features:
+  node_auto_provisioning: true      # managed Karpenter; false = cluster-autoscaler on cluster.user_node_pools
+  kms_etcd_encryption: true
+  defender: true
+  azure_policy: true
+  delete_lock: true
+  key_vault_secrets_provider: true
+  container_insights: true
+  managed_prometheus: true
+  keda: false
+  vpa: false
+  kyverno: true
+  reloader: true
+  rbac_manifests: true              # apply rbac/*.yaml next to this file
+
+cluster:
+  kubernetes_version: "1.35"        # quote it; az aks get-versions -l southafricanorth -o table
+  vnet_subnet_id: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-prod/providers/Microsoft.Network/virtualNetworks/vnet-myapp-prod/subnets/snet-aks-nodes
+  additional_network_contributor_scopes:
+    - /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-prod/providers/Microsoft.Network/routeTables/rt-aks-nodes
+  network:
+    outbound_type: userDefinedRouting   # egress through the hub firewall
+  system_node_pool:
+    vm_size: Standard_D4ds_v5
+    node_count: 3
+  admin_group_object_ids:
+    - 11111111-1111-1111-1111-111111111111   # Entra group: AKS-Platform-Admins
+  cluster_role_assignments:
+    developers:
+      principal_id: 22222222-2222-2222-2222-222222222222   # Entra group: AKS-Developers
+      role: Azure Kubernetes Service RBAC Writer
+      namespace: myapp
+    readonly:
+      principal_id: 33333333-3333-3333-3333-333333333333   # Entra group: AKS-ReadOnly
+      role: Azure Kubernetes Service RBAC Reader
+  acr_ids:
+    - /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-shared/providers/Microsoft.ContainerRegistry/registries/acrsharedprod
+  log_retention_in_days: 90
+  maintenance_window:
+    day_of_week: Sunday
+    start_time: "00:00"
+    utc_offset: "+02:00"
+
+platform:
+  platform_key_vault_id: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-shared/providers/Microsoft.KeyVault/vaults/kv-platform-prod
+  traefik:
+    replicas: 3
+    lb_subnet_name: snet-aks-ingress
+  argocd:
+    domain: argocd.myapp.example.com
+    git_credentials_secret_name: GithubCreds
+    repositories:
+      kyverno-policies:
+        url: https://github.com/my-org/kyverno-policies.git
+      myapp-manifests:
+        url: https://github.com/my-org/myapp-manifests.git
+        project: myapp
+  kyverno_dashboard_domain: kyvpol.myapp.example.com
+  node_pools:                       # used when features.node_auto_provisioning is true
+    general:
+      labels:
+        application-team: myapp
+    memory:
+      sku_families: [E]
+      cpu_counts: ["4", "8", "16"]
+      weight: 5
+      labels:
+        workload-type: memory-optimized
+      taints:
+        - key: workload-type
+          value: memory-optimized
+          effect: NoSchedule
+      cpu_limit: "256"

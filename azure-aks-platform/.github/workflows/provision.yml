@@ -1,0 +1,103 @@
+# Reusable workflow that customer (spoke) repos call to plan/apply their AKS environment.
+# The spoke supplies only environments/<env>/config.yaml (+ optional rbac/*.yaml) and a short caller workflow.
+name: Provision AKS environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Folder under environments/ in the customer repo (e.g. prod)
+        type: string
+        required: true
+      action:
+        description: plan or apply
+        type: string
+        default: plan
+      platform_version:
+        description: Tag of azure-aks-platform to run. Use the same tag as the @ref in the caller's `uses:`.
+        type: string
+        required: true
+      state_resource_group:
+        type: string
+        required: true
+      state_storage_account:
+        type: string
+        required: true
+      runs_on:
+        description: JSON runner labels. The runner must reach the private API server (self-hosted in or peered to the VNet).
+        type: string
+        default: '["self-hosted", "linux"]'
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      PLATFORM_REPO_TOKEN:
+        description: Read token for azure-aks-platform, if it is private to the caller
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  provision:
+    name: ${{ inputs.action }} ${{ inputs.environment }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    # Applies go through the "<env>" GitHub environment (add required reviewers there); plans use "<env>-plan"
+    environment: ${{ inputs.action == 'apply' && inputs.environment || format('{0}-plan', inputs.environment) }}
+    concurrency:
+      group: aks-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      CONFIG_FILE: spoke/environments/${{ inputs.environment }}/config.yaml
+      TF_STATE_RESOURCE_GROUP: ${{ inputs.state_resource_group }}
+      TF_STATE_STORAGE_ACCOUNT: ${{ inputs.state_storage_account }}
+      TF_STATE_KEY_PREFIX: ${{ github.repository }}/${{ inputs.environment }}
+      TF_IN_AUTOMATION: "true"
+      ACTION: ${{ inputs.action }}
+    steps:
+      - name: Validate inputs
+        run: |
+          case "$ACTION" in plan|apply) ;; *) echo "::error::action must be plan or apply"; exit 1 ;; esac
+
+      - name: Checkout customer config
+        uses: actions/checkout@v4
+        with:
+          path: spoke
+
+      - name: Checkout platform ${{ inputs.platform_version }}
+        uses: actions/checkout@v4
+        with:
+          repository: my-org/azure-aks-platform
+          ref: ${{ inputs.platform_version }}
+          token: ${{ secrets.PLATFORM_REPO_TOKEN || github.token }}
+          path: platform
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4 # same version the hub tests run on
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install kubelogin
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          az aks install-cli --install-location "$HOME/.local/bin/kubectl" --kubelogin-install-location "$HOME/.local/bin/kubelogin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: 01-cluster ${{ inputs.action }}
+        run: bash platform/scripts/run-stack.sh 01-cluster "$ACTION" "$CONFIG_FILE"
+
+      - name: 02-platform ${{ inputs.action }}
+        env:
+          TF_VAR_kubelogin_login_mode: azurecli # uses the az session from azure/login
+        run: bash platform/scripts/run-stack.sh 02-platform "$ACTION" "$CONFIG_FILE"

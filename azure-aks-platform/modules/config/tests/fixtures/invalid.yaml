@@ -1,0 +1,11 @@
+name: myapp
+environment: dev
+location: southafricanorth
+feature:
+  kyverno: false
+cluster:
+  kubernetes_version: "1.35"
+  vnet_subnet: /subscriptions/x
+platform:
+  argocd:
+    domain: argocd.example.com
